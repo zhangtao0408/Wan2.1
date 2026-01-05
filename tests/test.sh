@@ -105,9 +105,22 @@ function i2v_14B_720p() {
     torchrun --nproc_per_node=$GPUS $PY_FILE --task i2v-14B --ckpt_dir $I2V_14B_CKPT_DIR --size 720*1280 --dit_fsdp --t5_fsdp --ulysses_size $GPUS
 }
 
+function flf2v_14B_720p() {
+    I2V_14B_CKPT_DIR="$MODEL_DIR/Wan2.1-I2V-14B-720P"
+
+    # 1-GPU Test
+    echo -e "\n\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> i2v_14B 1-GPU Test: "
+    python $PY_FILE --task flf2v-14B --size 720*1280 --ckpt_dir $I2V_14B_CKPT_DIR
+
+    # Multiple GPU Test
+    echo -e "\n\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> i2v_14B Multiple GPU Test: "
+    torchrun --nproc_per_node=$GPUS $PY_FILE --task flf2v-14B --ckpt_dir $I2V_14B_CKPT_DIR --size 720*1280 --dit_fsdp --t5_fsdp --ulysses_size $GPUS
+}
+
 
 t2i_14B
 t2v_1_3B
 t2v_14B
 i2v_14B_480p
 i2v_14B_720p
+flf2v_14B_720p
