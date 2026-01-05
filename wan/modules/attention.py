@@ -161,7 +161,7 @@ def attention(
                                 opt_mode="manual", op_type="ascend_laser_attention", layout="BNSD")
         else:
             out = attention_forward(q, k, v,
-                                opt_mode="manual", op_type="fused_attn_score", layout="BNSD")
+                                opt_mode="manual", op_type="fused_attn_score", layout="BSND")
         return out.to(qtype)
     elif FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
         return flash_attention(
