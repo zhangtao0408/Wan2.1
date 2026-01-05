@@ -46,6 +46,7 @@ class WanI2V:
         t5_cpu=False,
         init_on_cpu=True,
         use_vae_parallel=False,
+        quant_dit_path=None,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -117,6 +118,19 @@ class WanI2V:
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
         self.model = WanModel.from_pretrained(checkpoint_dir, torch_dtype=self.param_dtype)
+        if quant_dit_path:
+            quant_dit_path = os.path.abspath(quant_dit_path)
+            quant_dit_desc_path = os.path.join(quant_dit_path, "quant_model_description_w8a8_dynamic.json")
+            if not os.path.exists(quant_dit_desc_path):
+                raise FileNotFoundError(f"Quantization description file not found: {quant_dit_desc_path}")
+            logging.info(f"Enabled quant, trying to load quantized DiT model from {quant_dit_path}...")
+            from mindiesd import quantize
+            quantize(
+                model=self.model,
+                quant_des_path=quant_dit_desc_path,
+                use_nz=True
+            )
+            logging.info("Load quantized DiT model successfully")
         self.model.eval().requires_grad_(False)
 
         if t5_fsdp or dit_fsdp or use_usp:
@@ -335,7 +349,7 @@ class WanI2V:
                 torch.cuda.empty_cache()
 
             self.model.to(self.device)
-            for _, t in enumerate(tqdm(timesteps)):
+            for t_idx, t in enumerate(tqdm(timesteps)):
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
@@ -343,7 +357,7 @@ class WanI2V:
 
                 if get_classifier_free_guidance_world_size() == 2:
                     noise_pred = self.model(
-                        latent_model_input, t=timestep, **arg_all)[0].to(
+                        latent_model_input, t=timestep, **arg_all, t_idx=t_idx)[0].to(
                             torch.device('cpu') if offload_model else self.device)
                     noise_pred_cond, noise_pred_uncond = get_cfg_group().all_gather(
                         noise_pred, separate_tensors=True
@@ -352,12 +366,12 @@ class WanI2V:
                         torch.cuda.empty_cache()
                 else:
                     noise_pred_cond = self.model(
-                        latent_model_input, t=timestep, **arg_c)[0].to(
+                        latent_model_input, t=timestep, **arg_c, t_idx=t_idx)[0].to(
                             torch.device('cpu') if offload_model else self.device)
                     if offload_model:
                         torch.cuda.empty_cache()
                     noise_pred_uncond = self.model(
-                        latent_model_input, t=timestep, **arg_null)[0].to(
+                        latent_model_input, t=timestep, **arg_null, t_idx=t_idx)[0].to(
                             torch.device('cpu') if offload_model else self.device)
                     if offload_model:
                         torch.cuda.empty_cache()

@@ -63,6 +63,8 @@ def _validate_args(args):
     # The default sampling steps are 40 for image-to-video tasks and 50 for text-to-video tasks.
     if args.sample_steps is None:
         args.sample_steps = 40 if "i2v" in args.task else 50
+    else:
+        assert args.sample_steps >= 1 , f"sample_steps should be >= 1, but get {args.sample_steps}"
 
     if args.sample_shift is None:
         args.sample_shift = 5.0
@@ -70,10 +72,14 @@ def _validate_args(args):
             args.sample_shift = 3.0
         if "flf2v" in args.task:
             args.sample_shift = 16
+    else:
+        assert args.sample_shift > 0.0 , f"sample_shift should be > 0, but get {args.sample_shift}"
 
     # The default number of frames are 1 for text-to-image tasks and 81 for other tasks.
     if args.frame_num is None:
         args.frame_num = 1 if "t2i" in args.task else 81
+    else:
+        assert args.frame_num > 1 and(args.frame_num - 1) % 4 == 0, f"frame_num should be 4n+1 (n>0), but get {args.frame_num}"
 
     # T2I frame_num check
     if "t2i" in args.task:
@@ -81,6 +87,17 @@ def _validate_args(args):
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
+    
+    if args.cfg_size < 1 or args.ulysses_size < 1 or args.ring_size < 1 or args.tp_size < 1:
+        raise ValueError(f"cfg_size, ulysses_size, ring_size and tp_size must >= 1, \
+                         but get cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}, ring_size={args.ring_size}, tp_size={args.tp_size}")
+
+    if args.tp_size > 1:
+        assert args.ulysses_size == 1 and args.ring_size == 1, \
+            f"tp only supported when ulysses_size == 1, and ring_size == 1, but get ulysses_size {args.ulysses_size}, ring_size {args.ring_size}  "
+    
+    assert args.cfg_size in (1, 2), f"cfg_size only support 1 or 2, but get {args.cfg_size}"
+
     # Size check
     assert args.size in SUPPORTED_SIZES[
         args.
@@ -232,21 +249,15 @@ def _parse_args():
         default=5.0,
         help="Classifier free guidance scale.")
     parser.add_argument(
-        "--quant_desc_path",
+        "--quant_dit_path",
         type=str,
         help="Path to quantization description file (enables quantization if provided, format: quant_model_description_*.json)"
     )
     
     parser = add_attentioncache_args(parser)
+    parser = add_rainfusion_args(parser)
     args = parser.parse_args()
-
     _validate_args(args)
-
-    # Validate quantization file existence if path is provided
-    if args.quant_desc_path:
-        if not os.path.exists(args.quant_desc_path):
-            raise FileNotFoundError(f"Quantization description file not found: {args.quant_desc_path}")
-        logging.info(f"Quantization enabled. Using description file: {args.quant_desc_path}")
 
     return args
 
@@ -259,6 +270,16 @@ def add_attentioncache_args(parser: argparse.ArgumentParser):
     group.add_argument("--attentioncache_interval", type=int, default=4)
     group.add_argument("--start_step", type=int, default=12)
     group.add_argument("--end_step", type=int, default=37)
+
+    return parser
+
+
+def add_rainfusion_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(title="Rainfusion args")
+
+    group.add_argument("--use_rainfusion", action='store_true', help="Whether to use sparse fa")
+    group.add_argument("--sparsity", type=float, default=0.64, help="Sparsity of flash attention, greater means more speed")
+    group.add_argument("--sparse_start_step", type=int, default=15)
 
     return parser
 
@@ -347,6 +368,13 @@ def generate(args):
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]
 
+    rainfusion_config = {
+        "sparsity": args.sparsity,
+        "skip_timesteps": args.sparse_start_step,
+        "grid_size": None,
+        "atten_mask_all": None
+    }
+
     if "t2v" in args.task or "t2i" in args.task:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
@@ -387,39 +415,22 @@ def generate(args):
         )
 
         transformer = wan_t2v.model
+
+        if args.use_rainfusion:
+            if args.dit_fsdp:
+                transformer._fsdp_wrapped_module.rainfusion_config = rainfusion_config
+            else:
+                transformer.rainfusion_config = rainfusion_config
+
         if args.tp_size > 1:
             logging.info("Initializing tensor parallel...")
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
             applicator.apply_to_model(transformer)
         wan_t2v.model.to("npu")
 
-        # Apply quantization if description file is provided
-        if args.quant_desc_path:
-            # Import quantization module only when needed to reduce dependencies
-            from mindiesd import quantize
-            # Apply quantization
-            quantize(
-                model=transformer,
-                quant_des_path=args.quant_desc_path,
-                use_nz=True
-            )
-            # Ensure quantized model is on the correct device
-            transformer = transformer.to(device)
-            logging.info("Quantization applied successfully")
-
-        if args.use_attentioncache:
-            config = CacheConfig(
+        config = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer.blocks),
-                steps_count=args.sample_steps,
-                step_start=args.start_step,
-                step_interval=args.attentioncache_interval,
-                step_end=args.end_step
-            )
-        else:
-            config = CacheConfig(
-                method="attention_cache",
-                blocks_count=len(transformer.blocks),
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps
             )
         cache = CacheAgent(config)
@@ -443,7 +454,27 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
-        
+
+        if args.use_attentioncache:
+            config = CacheConfig(
+                method="attention_cache",
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
+                steps_count=args.sample_steps,
+                step_start=args.start_step,
+                step_interval=args.attentioncache_interval,
+                step_end=args.end_step
+            )
+            cache = CacheAgent(config)
+            if args.dit_fsdp:
+                for block in transformer._fsdp_wrapped_module.blocks:
+                    block._fsdp_wrapped_module.cache = cache
+                    block._fsdp_wrapped_module.args = args
+            else:
+                for block in transformer.blocks:
+                    block.cache = cache
+                    block.args = args
+
+        logging.info(f"Generating video ...")
         stream.synchronize()
         begin = time.time()
         video = wan_t2v.generate(
@@ -503,42 +534,26 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
             use_vae_parallel=args.vae_parallel,
+            quant_dit_path=args.quant_dit_path,
         )
 
         transformer = wan_i2v.model
+
+        if args.use_rainfusion:
+            if args.dit_fsdp:
+                transformer._fsdp_wrapped_module.rainfusion_config = rainfusion_config
+            else:
+                transformer.rainfusion_config = rainfusion_config
+
         if args.tp_size > 1:
             logging.info("Initializing tensor parallel...")
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
             applicator.apply_to_model(transformer)
         wan_i2v.model.to("npu")
 
-        # Apply quantization if description file is provided
-        if args.quant_desc_path:
-            # Import quantization module only when needed to reduce dependencies
-            from mindiesd import quantize
-            # Apply quantization
-            quantize(
-                model=transformer,
-                quant_des_path=args.quant_desc_path,
-                use_nz=True
-            )
-            # Ensure quantized model is on the correct device
-            transformer = transformer.to(device)
-            logging.info("Quantization applied successfully")
-
-        if args.use_attentioncache:
-            config = CacheConfig(
+        config = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer.blocks),
-                steps_count=args.sample_steps,
-                step_start=args.start_step,
-                step_interval=args.attentioncache_interval,
-                step_end=args.end_step
-            )
-        else:
-            config = CacheConfig(
-                method="attention_cache",
-                blocks_count=len(transformer.blocks),
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps
             )
         cache = CacheAgent(config)
@@ -550,7 +565,7 @@ def generate(args):
             for block in transformer.blocks:
                 block.cache = cache
                 block.args = args
-        
+
         logging.info(f"Warm up 2 steps...")
         video = wan_i2v.generate(
             args.prompt,
@@ -563,6 +578,25 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+
+        if args.use_attentioncache:
+            config = CacheConfig(
+                method="attention_cache",
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
+                steps_count=args.sample_steps,
+                step_start=args.start_step,
+                step_interval=args.attentioncache_interval,
+                step_end=args.end_step
+            )
+            cache = CacheAgent(config)
+            if args.dit_fsdp:
+                for block in transformer._fsdp_wrapped_module.blocks:
+                    block._fsdp_wrapped_module.cache = cache
+                    block._fsdp_wrapped_module.args = args
+            else:
+                for block in transformer.blocks:
+                    block.cache = cache
+                    block.args = args
 
         logging.info("Generating video ...")
         stream.synchronize()
@@ -626,22 +660,26 @@ def generate(args):
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
             use_vae_parallel=args.vae_parallel,
+            quant_dit_path=args.quant_dit_path,
         )
 
         transformer = wan_flf2v.model
-        if args.use_attentioncache:
-            config = CacheConfig(
+
+        if args.use_rainfusion:
+            if args.dit_fsdp:
+                transformer._fsdp_wrapped_module.rainfusion_config = rainfusion_config
+            else:
+                transformer.rainfusion_config = rainfusion_config
+        
+        if args.tp_size > 1:
+            logging.info("Initializing tensor parallel...")
+            applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
+            applicator.apply_to_model(transformer)
+        wan_flf2v.model.to("npu")
+
+        config = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer.blocks),
-                steps_count=args.sample_steps,
-                step_start=args.start_step,
-                step_interval=args.attentioncache_interval,
-                step_end=args.end_step
-            )
-        else:
-            config = CacheConfig(
-                method="attention_cache",
-                blocks_count=len(transformer.blocks),
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps
             )
         cache = CacheAgent(config)
@@ -668,6 +706,25 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model)
         
+        if args.use_attentioncache:
+            config = CacheConfig(
+                method="attention_cache",
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
+                steps_count=args.sample_steps,
+                step_start=args.start_step,
+                step_interval=args.attentioncache_interval,
+                step_end=args.end_step
+            )
+            cache = CacheAgent(config)
+            if args.dit_fsdp:
+                for block in transformer._fsdp_wrapped_module.blocks:
+                    block._fsdp_wrapped_module.cache = cache
+                    block._fsdp_wrapped_module.args = args
+            else:
+                for block in transformer.blocks:
+                    block.cache = cache
+                    block.args = args
+    
         logging.info("Generating video ...")
         stream.synchronize()
         begin = time.time()
