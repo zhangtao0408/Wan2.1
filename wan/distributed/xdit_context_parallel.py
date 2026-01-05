@@ -27,21 +27,14 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs_list):
     """
     x:          [B, L, N, C].
     grid_sizes: [B, 3].
     freqs:      [M, C // 2].
     """
-    s, n, c = x.size(1), x.size(2), x.size(3)
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        x_i = x[i, :s].reshape(1, s, n, c)
-        cos, sin = freqs_list[i]
-        x_i = rotary_position_embedding(x_i, cos, sin, rotated_mode="rotated_interleaved", fused=True)
-        output.append(x_i)
-    return torch.cat(output).float()
+    cos, sin = freqs_list[0]
+    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
 
 
 def usp_dit_forward(
