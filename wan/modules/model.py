@@ -1,17 +1,23 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-
+import logging
 import torch
-import torch_npu
+try:
+    import torch_npu
+    from wan.utils.rainfusion import Rainfusion
+    from mindiesd import rotary_position_embedding
+    npu_available = True
+except:
+    npu_available = False
+    Rainfusion = None
+    rotary_position_embedding = None
+
 import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention, attention
-
-from mindiesd import rotary_position_embedding
-
 __all__ = ['WanModel']
 
 T5_CONTEXT_TOKEN_NUMBER = 512
@@ -47,9 +53,11 @@ def rope_apply(x, grid_sizes, freqs_list):
     grid_sizes: [B, 3].
     freqs:      [M, C // 2].
     """
-    cos, sin = freqs_list[0]
-    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
-
+    if rotary_position_embedding:
+        cos, sin = freqs_list[0]
+        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
+    else:
+        raise NotImplementedError("rotary_position_embedding is not available")
 
 class WanRMSNorm(nn.Module):
 
@@ -130,7 +138,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, args=None):
+    def forward(self, x, seq_lens, grid_sizes, freqs, args=None, rainfusion_config=None, t_idx=None):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -154,7 +162,10 @@ class WanSelfAttention(nn.Module):
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
             k_lens=seq_lens,
-            window_size=self.window_size)
+            window_size=self.window_size,
+            rainfusion_config=rainfusion_config,
+            t_idx=t_idx,
+        )
 
         # output
         x = x.flatten(2)
@@ -279,7 +290,7 @@ class WanAttentionBlock(nn.Module):
             nn.Linear(ffn_dim, dim))
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
         # Attention_cache
         self.cache = None
@@ -296,6 +307,8 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        rainfusion_config,
+        t_idx,
     ):
         r"""
         Args:
@@ -314,10 +327,14 @@ class WanAttentionBlock(nn.Module):
         y = self.cache.apply(
             self.self_attn,
             self.norm1(x, 1 + e[1], e[0]), 
-            # self.norm1(x).float() * (1 + e[1]) + e[0], 
+            # self.norm1(x) * (1 + e[1]) + e[0], 
             seq_lens, 
             grid_sizes,
-            freqs, self.args)
+            freqs, 
+            self.args,
+            rainfusion_config=rainfusion_config,
+            t_idx=t_idx
+        )
         # with amp.autocast(dtype=torch.float32):
         x = x + y * e[2]
 
@@ -325,7 +342,7 @@ class WanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x, 1 + e[4], e[3]))
-            # y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
+            # y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             # with amp.autocast(dtype=torch.float32):
             x = x + y * e[5]
             return x
@@ -349,7 +366,7 @@ class Head(nn.Module):
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim ** 0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
     def forward(self, x, e):
         r"""
@@ -508,6 +525,8 @@ class WanModel(ModelMixin, ConfigMixin):
 
         self.freqs_list = None
 
+        self.rainfusion_config = None
+
     def forward(
         self,
         x,
@@ -516,6 +535,7 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        t_idx=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -530,7 +550,7 @@ class WanModel(ModelMixin, ConfigMixin):
             seq_len (`int`):
                 Maximum sequence length for positional encoding
             clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode or first-last-frame-to-video mode
+                CLIP image features for image-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
 
@@ -538,6 +558,14 @@ class WanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        if self.rainfusion_config and self.rainfusion_config["atten_mask_all"] is None:
+            self.rainfusion_config["grid_size"] = Rainfusion.get_grid_size(x[0].shape, self.patch_size)
+            logging.info(f"Rainfusion grid size: {self.rainfusion_config['grid_size']}")
+            self.rainfusion_config["atten_mask_all"] = Rainfusion.get_atten_mask(
+                grid_size=self.rainfusion_config["grid_size"],
+                sparsity=self.rainfusion_config["sparsity"]
+            )
+
         if self.model_type == 'i2v' or self.model_type == 'flf2v':
             assert clip_fea is not None and y is not None
         # params
@@ -610,7 +638,10 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs_list,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            rainfusion_config=self.rainfusion_config,
+            t_idx=t_idx,
+        )
 
         for block in self.blocks:
             x = block(x, **kwargs)

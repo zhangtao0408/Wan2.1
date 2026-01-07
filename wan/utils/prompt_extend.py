@@ -7,7 +7,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Optional, Union, List
+from typing import Optional, Union
 
 import dashscope
 import torch
@@ -47,7 +47,7 @@ LM_EN_SYS_PROMPT = \
     '''4. Prompts should match the user’s intent and accurately reflect the specified style. If the user does not specify a style, choose the most appropriate style for the video;\n''' \
     '''5. Emphasize motion information and different camera movements present in the input description;\n''' \
     '''6. Your output should have natural motion attributes. For the target category described, add natural actions of the target using simple and direct verbs;\n''' \
-    '''7. The revised prompt should be around 80-100 words long.\n''' \
+    '''7. The revised prompt should be around 80-100 characters long.\n''' \
     '''Revised prompt examples:\n''' \
     '''1. Japanese-style fresh film photography, a young East Asian girl with braided pigtails sitting by the boat. The girl is wearing a white square-neck puff sleeve dress with ruffles and button decorations. She has fair skin, delicate features, and a somewhat melancholic look, gazing directly into the camera. Her hair falls naturally, with bangs covering part of her forehead. She is holding onto the boat with both hands, in a relaxed posture. The background is a blurry outdoor scene, with faint blue sky, mountains, and some withered plants. Vintage film texture photo. Medium shot half-body portrait in a seated position.\n''' \
     '''2. Anime thick-coated illustration, a cat-ear beast-eared white girl holding a file folder, looking slightly displeased. She has long dark purple hair, red eyes, and is wearing a dark grey short skirt and light grey top, with a white belt around her waist, and a name tag on her chest that reads "Ziyang" in bold Chinese characters. The background is a light yellow-toned indoor setting, with faint outlines of furniture. There is a pink halo above the girl's head. Smooth line Japanese cel-shaded style. Close-up half-body slightly overhead view.\n''' \
@@ -181,25 +181,21 @@ class PromptExpander:
     def extend(self, prompt, system_prompt, seed=-1, *args, **kwargs):
         pass
 
-    def decide_system_prompt(self, tar_lang="zh", multi_images_input=False):
+    def decide_system_prompt(self, tar_lang="zh"):
         zh = tar_lang == "zh"
-        self.is_vl |= multi_images_input
-        task_type = zh + (self.is_vl << 1) + (multi_images_input << 2)
-        return SYSTEM_PROMPT_TYPES[task_type]
+        if zh:
+            return LM_ZH_SYS_PROMPT if not self.is_vl else VL_ZH_SYS_PROMPT
+        else:
+            return LM_EN_SYS_PROMPT if not self.is_vl else VL_EN_SYS_PROMPT
 
     def __call__(self,
                  prompt,
-                 system_prompt=None,
                  tar_lang="zh",
                  image=None,
                  seed=-1,
                  *args,
                  **kwargs):
-        if system_prompt is None:
-            system_prompt = self.decide_system_prompt(
-                tar_lang=tar_lang,
-                multi_images_input=isinstance(image, (list, tuple)) and len(image) > 1
-            )
+        system_prompt = self.decide_system_prompt(tar_lang=tar_lang)
         if seed < 0:
             seed = random.randint(0, sys.maxsize)
         if image is not None and self.is_vl:
@@ -289,42 +285,38 @@ class DashScopePromptExpander(PromptExpander):
     def extend_with_img(self,
                         prompt,
                         system_prompt,
-                        image: Union[List[Image.Image], List[str], Image.Image, str] = None,
+                        image: Union[Image.Image, str] = None,
                         seed=-1,
                         *args,
                         **kwargs):
-
-        def ensure_image(_image):
-            if isinstance(_image, str):
-                _image = Image.open(_image).convert('RGB')
-            w = _image.width
-            h = _image.height
-            area = min(w * h, self.max_image_size)
-            aspect_ratio = h / w
-            resized_h = round(math.sqrt(area * aspect_ratio))
-            resized_w = round(math.sqrt(area / aspect_ratio))
-            _image = _image.resize((resized_w, resized_h))
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-                _image.save(f.name)
-                image_path = f"file://{f.name}"
-            return image_path
-        if not isinstance(image, (list, tuple)):
-            image = [image]
-        image_path_list = [ensure_image(_image) for _image in image]
-        role_content = [
-            {"text": prompt},
-            *[{"image": image_path} for image_path in image_path_list]
-        ]
-        system_content = [{"text": system_prompt}]
+        if isinstance(image, str):
+            image = Image.open(image).convert('RGB')
+        w = image.width
+        h = image.height
+        area = min(w * h, self.max_image_size)
+        aspect_ratio = h / w
+        resized_h = round(math.sqrt(area * aspect_ratio))
+        resized_w = round(math.sqrt(area / aspect_ratio))
+        image = image.resize((resized_w, resized_h))
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            image.save(f.name)
+            fname = f.name
+            image_path = f"file://{f.name}"
         prompt = f"{prompt}"
         messages = [
             {
                 'role': 'system',
-                'content': system_content
+                'content': [{
+                    "text": system_prompt
+                }]
             },
             {
                 'role': 'user',
-                'content': role_content
+                'content': [{
+                    "text": prompt
+                }, {
+                    "image": image_path
+                }]
             },
         ]
         response = None
@@ -347,8 +339,7 @@ class DashScopePromptExpander(PromptExpander):
             except Exception as e:
                 exception = e
         result_prompt = result_prompt.replace('\n', '\\n')
-        for image_path in image_path_list:
-            os.remove(image_path.removeprefix('file://'))
+        os.remove(fname)
 
         return PromptOutput(
             status=status,
@@ -459,36 +450,30 @@ class QwenPromptExpander(PromptExpander):
     def extend_with_img(self,
                         prompt,
                         system_prompt,
-                        image: Union[List[Image.Image], List[str], Image.Image, str] = None,
+                        image: Union[Image.Image, str] = None,
                         seed=-1,
                         *args,
                         **kwargs):
         self.model = self.model.to(self.device)
-
-        if not isinstance(image, (list, tuple)):
-            image = [image]
-
-        system_content = [{
-            "type": "text",
-            "text": system_prompt
-        }]
-        role_content = [
-            {
-                "type": "text",
-                "text": prompt
-            },
-            *[
-                {"image": image_path} for image_path in image
-            ]
-        ]
-
         messages = [{
             'role': 'system',
-            'content': system_content,
+            'content': [{
+                "type": "text",
+                "text": system_prompt
+            }]
         }, {
             "role":
                 "user",
-            "content": role_content,
+            "content": [
+                {
+                    "type": "image",
+                    "image": image,
+                },
+                {
+                    "type": "text",
+                    "text": prompt
+                },
+            ],
         }]
 
         # Preparation for inference

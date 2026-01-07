@@ -1,7 +1,12 @@
 import logging
 import torch
 from torch import Tensor
-import torch_npu
+try:
+    import torch_npu
+    npu_available = True
+except:
+    npu_available = False
+
 import torch.distributed as dist
 import math
 import os
@@ -11,11 +16,16 @@ try:
 except ImportError:
     raise ImportError("Please install yunchang 0.6.0 or later")
 from typing import Any
-
-from mindiesd import attention_forward
-
-from ..distributed.parallel_mgr import get_sp_group
-from ..distributed.comm import all_to_all_4D
+if npu_available:
+    from ..distributed.parallel_mgr import get_sp_group
+    from ..distributed.comm import all_to_all_4D
+    from wan.utils.rainfusion import Rainfusion
+    from mindiesd import attention_forward
+else:
+    from xfuser.core.distributed import get_sp_group
+    from xfuser.core.comm import all_to_all_4D
+    Rainfusion = None
+    attention_forward = None
 
 logger = logging.getLogger(__name__)
 MAX_TOKEN = 2147483647
@@ -32,6 +42,7 @@ class xFuserLongContextAttention(LongContextAttention):
         use_pack_qkv: bool = False,
         use_kv_cache: bool = False,
         attn_type: AttnType = AttnType.FA,
+        rainfusion_config=None,
     ) -> None:
         """
         Arguments:
@@ -62,13 +73,30 @@ class xFuserLongContextAttention(LongContextAttention):
 
         self.algo = int(os.getenv('ALGO', 0))
 
+        # TODO: Args
+        """
         if self.args.size in self.video_size:
             self.use_all_head = True
         else:
             self.use_all_head = False
+        """
+        self.use_all_head = True
         
         self.ulysses_pg = get_sp_group().ulysses_group
         self.ring_pg = get_sp_group().ring_group
+
+        if Rainfusion:
+            self.rainfusion_config = rainfusion_config
+            self.rainfusion_fa = None
+            if self.rainfusion_config is not None:
+                self.rainfusion_fa = Rainfusion(
+                    grid_size=rainfusion_config["grid_size"],
+                    skip_timesteps=rainfusion_config["skip_timesteps"],
+                    sparsity=rainfusion_config["sparsity"],
+                )
+        else:
+            self.rainfusion_config = None
+            self.rainfusion_fa = None
 
     def forward(
         self,
@@ -88,7 +116,8 @@ class xFuserLongContextAttention(LongContextAttention):
         deterministic=False,
         return_attn_probs=False,
         joint_strategy="none",
-        scale=None
+        scale=None,
+        t_idx=-1,
     ) -> Tensor:
         """forward
 
@@ -123,16 +152,27 @@ class xFuserLongContextAttention(LongContextAttention):
             dist.all_gather_into_tensor(v_full, value_layer, group=self.ring_pg)
             value_layer = v_full.permute(1, 0, 2, 3, 4).reshape(b, -1, n, d)
 
-
-        if self.use_all_head:
-            if self.algo == 0:
-                out = attention_forward(query_layer, key_layer, value_layer,
-                                        opt_mode="manual", op_type="fused_attn_score", layout="BNSD")
-            elif self.algo == 1:
-                out = attention_forward(query_layer, key_layer, value_layer,
-                                        opt_mode="manual", op_type="ascend_laser_attention", layout="BNSD")
+        if self.rainfusion_config is not None:
+            out = self.rainfusion_fa(
+                query_layer,
+                key_layer,
+                value_layer,
+                atten_mask_all=self.rainfusion_config["atten_mask_all"],
+                text_len=0,
+                t_idx=t_idx,
+            )
+        elif self.use_all_head:
+            if attention_forward:
+                if self.algo == 0:
+                    out = attention_forward(query_layer, key_layer, value_layer,
+                                            opt_mode="manual", op_type="fused_attn_score", layout="BNSD")
+                elif self.algo == 1:
+                    out = attention_forward(query_layer, key_layer, value_layer,
+                                            opt_mode="manual", op_type="ascend_laser_attention", layout="BNSD")
+                else:
+                    raise ValueError(f"select flash attention algorithm only support 0, 1, but got {self.algo}")
             else:
-                raise ValueError(f"select flash attention algorithm only support 0, 1, but got {self.algo}")
+                raise ValueError("attention_forward is not available")
         else:
             query_layer_list = query_layer.split(1, dim=2)
             key_layer_list = key_layer.split(1, dim=2)
